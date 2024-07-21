@@ -1,4 +1,16 @@
-# CUDA Training Resource
+# Simple LLM in pure CUDA C
+
+## To Do
+
+- [x] Softmax
+- [] Attention
+- [] Linear Layer
+- [] RMSNorm
+- [] GELU
+
+
+
+## Learning Material
 
 The materials in this repository accompany the CUDA Training Series presented at ORNL and NERSC.
 
