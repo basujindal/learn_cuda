@@ -19,23 +19,6 @@ const size_t DSIZE = 16384;      // matrix side dimension
 const int block_size = 1024;  // CUDA maximum is 1024
 const float element_val = 5;
 
-__global__ void row_sums(const float *A, float *sums, size_t ds){
-
-  int idx = threadIdx.x;
-  __shared__ float sdata[block_size];
-  sdata[idx] = 0.0f;
-
-  for(int i = 0; i < ds/blockDim.x; i++) sdata[idx] += A[ds*blockIdx.x + i*blockDim.x + idx];
-  
-  for(int s = blockDim.x/2; s > 0; s/=2){
-    __syncthreads();
-    if (idx < s) sdata[idx] += sdata[idx + s];
-  }
-  
-  if (idx == 0) sums[blockIdx.x] = sdata[0];
-
-}
-
 
 __global__ void softmax(float *A, float *sums, size_t ds){
 

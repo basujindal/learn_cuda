@@ -15,14 +15,12 @@
     } while (0)
 
 
-const int height = 2048;
-const int width = 4096;
-const int dim = 2048;
+const int height = 512;
+const int width = 1024;
+const int dim = 256;
 const int block_size = 32;  // CUDA maximum is 1024 *total* threads in block
 
-
-// matrix multiply (naive) kernel: C = A * B
-__global__ void mmul(const float *A, const float *B, float *C, int width, int height, int dim) {
+__global__ void mmul(const float *A, const float *B, float *C, float *bias, int width, int height, int dim) {
 
   // declare cache in shared memory
   __shared__ float As[block_size][block_size];
@@ -45,21 +43,20 @@ __global__ void mmul(const float *A, const float *B, float *C, int width, int he
       // Keep track of the running sum
       for (int k = 0; k < block_size; k++)
       	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
+    
       __syncthreads();
 
     }
 
     // Write to global memory
-    C[row*width+col] = temp;
+    C[row*width+col] = temp + bias[col];
   }
 }
 
 int main(){
 
-  float *h_A, *h_B, *h_C, *d_A, *d_B, *d_C;
+  float *h_A, *h_B, *h_C, *d_A, *d_B, *d_C, *d_bias, *h_bias;
 
-
-  // these are just for timing
   clock_t t0, t1, t2;
   double t1sum=0.0;
   double t2sum=0.0;
@@ -70,10 +67,12 @@ int main(){
   h_A = new float[height*dim];
   h_B = new float[dim*width];
   h_C = new float[height*width];
+  h_bias = new float[width];
 
   for (int i = 0; i < height*dim; i++) h_A[i] = rand()/(float)RAND_MAX;
   for (int i = 0; i < dim*width; i++) h_B[i] = rand()/(float)RAND_MAX;
   for (int i = 0; i < height*width; i++) h_C[i] = 0;
+  for (int i = 0; i < width; i++) h_bias[i] = rand()/(float)RAND_MAX;
     
 
   // Initialization timing
@@ -85,15 +84,18 @@ int main(){
   cudaMalloc(&d_A, height*dim*sizeof(float));
   cudaMalloc(&d_B, dim*width*sizeof(float));
   cudaMalloc(&d_C, height*width*sizeof(float));
+  cudaMalloc(&d_bias, width*sizeof(float));
+
   cudaCheckErrors("cudaMalloc failure");
   cudaMemcpy(d_A, h_A, height*dim*sizeof(float), cudaMemcpyHostToDevice);
   cudaMemcpy(d_B, h_B, dim*width*sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_bias, h_bias, width*sizeof(float), cudaMemcpyHostToDevice);
   cudaCheckErrors("cudaMemcpy H2D failure");
 
   // Launch kernel
   dim3 block(block_size, block_size);  // dim3 variable holds 3 dimensions
   dim3 grid((height+block.x-1)/block.x, (width+block.y-1)/block.y);
-  mmul<<<grid, block>>>(d_A, d_B, d_C, width, height, dim);
+  mmul<<<grid, block>>>(d_A, d_B, d_C, d_bias, width, height, dim);
   cudaCheckErrors("kernel launch failure");
 
   // Copy results back to host
@@ -107,18 +109,18 @@ int main(){
   // Verify results
   cudaCheckErrors("kernel execution failure or cudaMemcpy H2D failure");
 
-  // for (int i = 0; i < height; i++){
-  //   for (int j = 0; j < width; j++){
-  //     float sum = 0;
-      // for (int k = 0; k < dim; k++) sum += h_A[i*dim+k]*h_B[k*width+j];
+  for (int i = 0; i < height; i++){
+    for (int j = 0; j < width; j++){
+      float sum = 0;
+      for (int k = 0; k < dim; k++) sum += h_A[i*dim+k]*h_B[k*width+j] + h_bias[j];
       
-  //     if (h_C[i*width+j] - sum > 0.01) {
-  //     printf("mismatch at index %d, was: %f, should be: %f\n", i*width+j, h_C[i*width+j], sum);
-  //     return -1;
-  //     }
+      if (h_C[i*width+j] - sum > 0.01) {
+      printf("mismatch at index %d, was: %f, should be: %f\n", i*width+j, h_C[i*width+j], sum);
+      return -1;
+      }
 
-  //   }
-  // }
+    }
+  }
 
   printf("Success!\n"); 
   return 0;

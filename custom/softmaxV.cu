@@ -14,44 +14,21 @@
     } while (0)
 
 
-const size_t DSIZE = 16384;      // matrix side dimension
-// const size_t DSIZE = 1024;      // matrix side dimension
-const int block_size = 1024;  // CUDA maximum is 1024
-const float element_val = 5;
-const float Dim = 512;
-const float v_val = 1;
+const int N = 2048;      // matrix side dimension
+const int Dim = 2048;
+const int block_size = 32;  // CUDA maximum is 1024 *total* threads in block  
+const int block_size_softmax = 1024;  // CUDA maximum is 1024 *total* threads in block
 
 
-__global__ void softmax(float *A, float *sums, size_t ds){
+
+
+
+__global__ void softmax(float *QK, size_t ds){
 
   int idx = threadIdx.x;
-  __shared__ float sdata[block_size];
+  __shared__ float sdata[block_size_softmax];
   sdata[idx] = 0.0f;
   float val = 0;
-
-  for(int i = 0; i < ds/blockDim.x; i++){
-    val = expf(A[ds*blockIdx.x + i*blockDim.x + idx]);
-    A[ds*blockIdx.x + i*blockDim.x + idx] = val;
-    sdata[idx] += val;
-  }
-  
-  for(int s = blockDim.x/2; s > 0; s/=2){
-    __syncthreads();
-    if (idx < s) sdata[idx] += sdata[idx + s];
-  }
-  
-  if (idx == 0) sums[blockIdx.x] = sdata[0];
-  
-  for(int i = 0; i < ds/blockDim.x; i++) A[ds*blockIdx.x + i*blockDim.x + idx] /= sdata[0];
-  
-}
-
-__global__ void softmaxV(float *QK, float *V, float *ACT, size_t ds){
-
-  int idx = threadIdx.x;
-  __shared__ float sdata[block_size];
-  float val;
-  sdata[idx] = 0.0f;
 
   for(int i = 0; i < ds/blockDim.x; i++){
     val = expf(QK[ds*blockIdx.x + i*blockDim.x + idx]);
@@ -65,66 +42,153 @@ __global__ void softmaxV(float *QK, float *V, float *ACT, size_t ds){
   }
   
   for(int i = 0; i < ds/blockDim.x; i++) QK[ds*blockIdx.x + i*blockDim.x + idx] /= sdata[0];
-
-
   
 }
 
-bool validate(float *data, size_t sz){
+__global__ void matmul(const float *Attn, const float *V, float *C, int Dim, int N) {
+
+  // declare cache in shared memory
+  __shared__ float As[block_size][block_size];
+  __shared__ float Bs[block_size][block_size];
   
-  for (size_t i = 0; i < sz; i++){
-    // printf("%f\n", expf(0.005)*(float)sz);
-    float val = expf(element_val)*(float)sz;
-    if (data[i] - val > 0.001) {printf("results mismatch at %lu, was: %f, should be: %f\n", i, data[i], val); return false;}
+  int col = threadIdx.x+blockDim.x*blockIdx.x; // create thread x index
+  int row = threadIdx.y+blockDim.y*blockIdx.y; // create thread y index
+
+  if ((row < N) && (col < Dim)){
+    float temp = 0;
+
+    for (int i = 0; i < N/block_size; i++) {
+
+      // Load data into shared memory
+      As[threadIdx.y][threadIdx.x] = Attn[row*N + (block_size*i + threadIdx.x)];
+      Bs[threadIdx.y][threadIdx.x] = V[col + Dim*(block_size*i + threadIdx.y)];
+
+      __syncthreads();
+
+      for (int k = 0; k < block_size; k++) temp +=  As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
+
+      __syncthreads();
+
+    }
+    // Write to global memory
+    C[row*Dim+col] = temp;
   }
-    return true;
 }
+
+
+__global__ void QK_V(const float *QK, const float *V, float *C, int Dim, int N) {
+
+  // declare cache in shared memory
+  __shared__ float As[block_size][block_size];
+  __shared__ float Bs[block_size][block_size];
+  
+  int col = threadIdx.x+blockDim.x*blockIdx.x; // create thread x index
+  int row = threadIdx.y+blockDim.y*blockIdx.y; // create thread y index
+
+  if ((row < N) && (col < Dim)){
+    float temp = 0, val, sum = 0;
+
+    for (int i = 0; i < N/block_size; i++) {
+
+      // Load data into shared memory
+      As[threadIdx.y][threadIdx.x] = expf(QK[row*N + (block_size*i + threadIdx.x)]);
+      Bs[threadIdx.y][threadIdx.x] = V[col + Dim*(block_size*i + threadIdx.y)];
+
+      __syncthreads();
+
+      for (int k = 0; k < block_size; k++){
+        val = As[threadIdx.y][k];
+      	temp +=  val * Bs[k][threadIdx.x]; // dot product of row and column
+        sum+=val;
+      }
+
+      __syncthreads();
+
+    }
+
+    // Write to global memory
+    C[row*Dim+col] = temp/sum;
+  }
+}
+
+
+int validateQK_V(float *h_QK, float *h_V, float *h_ACT, int N, int Dim){
+
+  float sums[N];
+
+  for (int i = 0; i < N; i++){
+    for (int j = 0; j < N; j++){
+      h_QK[i*N+j] = expf(h_QK[i*N+j]);
+      sums[i] += h_QK[i*N+j];
+    }
+  }
+
+
+  for(int i = 0; i < N; i++) for (int j = 0; j < N; j++) h_QK[i*N+j] /= sums[i];
+  
+
+  for (int i = 0; i < N; i++){
+    for (int j = 0; j < Dim; j++){
+      float temp = 0;
+      for (int k = 0; k < N; k++) temp += h_QK[i*N+k]*h_V[k*Dim+j];
+
+      if (temp - h_ACT[i*Dim+j] > 0.1) {
+        printf("results mismatch at %d, was: %f, should be: %f\n", i*Dim+j, h_ACT[i*Dim+j], temp);
+        return -1;
+      }
+    }
+  }
+
+  printf("softmax correct!\n");
+  return 0;
+}
+
 int main(){
 
-    float *h_QK, *h_V;
+    float *h_QK, *h_V, *h_ACT;
     float *d_QK, *d_V, *d_ACT;
 
-    h_QK = new float[DSIZE*DSIZE];  // allocate space for data in host memory
-    // h_V = new float[DSIZE*Dim];
+    h_QK = new float[N*N];
+    h_V = new float[N*Dim];
+    h_ACT = new float[N*Dim];
 
-    for (int i = 0; i < DSIZE*DSIZE; i++)  h_QK[i] = element_val;
+    for (int i = 0; i < N*N; i++) h_QK[i] = rand()/(float)RAND_MAX;
+    for (int i = 0; i < N*Dim; i++) h_V[i] = rand()/(float)RAND_MAX;
 
-    for (int i = 0; i < DSIZE*Dim; i++) h_V[i] = v_val;
 
-    cudaMalloc(&d_QK, DSIZE*DSIZE*sizeof(float));  // allocate device space for A
-    // cudaMalloc(&d_V, DSIZE*Dim*sizeof(float));  // allocate device space for vector d_sums
-    cudaMalloc(&d_ACT, DSIZE*Dim*sizeof(float));  // allocate device space for vector d_sums
+    cudaMalloc(&d_QK, N*N*sizeof(float));
+    cudaMalloc(&d_V, N*Dim*sizeof(float));  
+    cudaMalloc(&d_ACT, N*Dim*sizeof(float)); 
+
 
     cudaCheckErrors("cudaMalloc failure"); // error checking
-    cudaMemcpy(d_QK, h_QK, DSIZE*DSIZE*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_QK, h_QK, N*N*sizeof(float), cudaMemcpyHostToDevice);
     cudaCheckErrors("cudaMemcpy H2D failure");
 
     cudaCheckErrors("cudaMalloc failure"); // error checking
-    // cudaMemcpy(d_V, h_V, DSIZE*Dim*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V, N*Dim*sizeof(float), cudaMemcpyHostToDevice);
     cudaCheckErrors("cudaMemcpy H2D failure");
 
-    softmax<<<DSIZE, block_size>>>(d_QK, d_ACT, DSIZE);
+    
+    dim3 block(block_size, block_size);
+    dim3 grid((Dim+block.x-1)/block.x, (N+block.y-1)/block.y);
+
+    // Fused QK_V
+    QK_V<<<grid, block>>>(d_QK, d_V, d_ACT, Dim, N);
+
+    // // Softmax + QK_V
+    // dim3 block2(block_size_softmax); 
+    // dim3 grid2((N+block.x-1)/block.x);
+    // softmax<<<grid2, block2>>>(d_QK, N);
+    // matmul<<<grid, block>>>(d_QK, d_V, d_ACT, Dim, N);
+    
     cudaCheckErrors("kernel launch failure");
 
-    // cudaMemcpy(h_sums, d_sums, DSIZE*sizeof(float), cudaMemcpyDeviceToHost);
-    // cudaCheckErrors("1 kernel execution failure or cudaMemcpy H2D failure");
-
-    // if (!validate(h_sums, DSIZE)) return -1; 
-    // printf("row sums correct!\n");
-
-    cudaMemcpy(h_QK, d_QK, DSIZE*DSIZE*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ACT, d_ACT, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
     cudaCheckErrors("cudaMemcpy D2H failure");
 
-    printf("%.15f\n", h_QK[0]);
-
-    for(int i = 0; i < DSIZE*DSIZE; i++){
-    // printf("%f\n %f\n", h_A[i], 1/(float)DSIZE);
-    if(h_QK[i] - 1/(float)DSIZE > 0.00001
-    ) {printf("results mismatch at %d, was: %.10f, should be: %.10f\n", i, h_QK[i], 1/float(DSIZE)); return -1;}
-    }
-    printf("softmax correct!\n");
-
-
+    // Vlaidate softmax(QK)*V
+    // validateQK_V(h_QK, h_V, h_ACT, N, Dim);
 
     return 0;
 }
