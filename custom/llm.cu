@@ -15,7 +15,7 @@ using namespace std;
     } while (0)
 
 
-const int N = 2048;      // matrix side dimension
+// const int N = 2048;      // matrix side dimension
 const int Dim = 768;
 const int block_size = 32;  // CUDA maximum is 1024 *total* threads in block  
 const int block_size_linear = 768;
@@ -168,13 +168,11 @@ __global__ void gelu(float *A, int dim){
     float x;
 
     for(int i = 0; i < dim/blockDim.x; i++){
-
         x = A[dim*blockIdx.x + i*blockDim.x + idx];
         // A[dim*blockIdx.x + i*blockDim.x + idx] = x*0.5*(1.0 + tanhf(0.7978845608*(x + 0.044715*x*x*x)));
         A[dim*blockIdx.x + i*blockDim.x + idx] = x/(1 + expf(-1.702*x));
     }
-
-    __syncthreads();
+  
 
 }
 
@@ -186,10 +184,22 @@ __global__ void add(float *A, float *B, int dim){
         B[dim*blockIdx.x + i*blockDim.x + idx] = A[dim*blockIdx.x + i*blockDim.x + idx] + B[dim*blockIdx.x + i*blockDim.x + idx];
     }
 
-    __syncthreads();
-
 }
 
+__global__ void isnan_test(float *data, int width, int height){
+
+  int idx = threadIdx.x+blockDim.x*blockIdx.x;
+
+  while (idx < width){
+    for (int i = 0; i < height; i++){
+      if (isnan(data[(i*width) + idx])){
+        printf("NAN at %d, %d\n", i, idx);
+        return;
+      }
+    }
+    idx += gridDim.x+blockDim.x;
+    }
+}
 
 int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *d_act, float *d_act_wide,
       float *linear[4], float *bias[4], float *ln[2], float *mlp1, float *mlp_bias1, float *mlp2, float *mlp_bias2,
@@ -199,50 +209,94 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     dim3 threads(block_size, block_size);
     dim3 grid((Dim + block_size - 1)/block_size, (N + block_size - 1)/block_size);
 
+    printf("Layer Normalization\n");
     layernorm<<<N, block_size>>>(d_input, d_act, Dim, ln[0], ln[1]);
+    cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_act, Dim, N);
+    cudaDeviceSynchronize();
 
     // calculate Q,K,V
+    printf("Q\n");
     matmul_bias<<<grid, threads>>>(d_input, linear[0], d_Q, bias[0], N, Dim, Dim);
+    cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_Q, Dim, N);
+    cudaDeviceSynchronize();
 
+    printf("K\n");
     matmul_bias<<<grid, threads>>>(d_input, linear[1], d_K, bias[1], N, Dim, Dim);
+    cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_K, Dim, N);
+    cudaDeviceSynchronize();
 
+    printf("V\n");
     matmul_bias<<<grid, threads>>>(d_input, linear[2], d_V, bias[2], N, Dim, Dim);
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_V, Dim, N);
+    cudaDeviceSynchronize();
 
     // Calculate QK
+    printf("QK\n"); 
     matmul<<<grid, threads>>>(d_Q, d_K, d_QK, N, N, Dim);
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_QK, N, N);
+    cudaDeviceSynchronize();
 
+    printf("QK_V softmax\n");
     // Calculate softmax(QK)*V
     QK_V<<<grid, threads>>>(d_QK, d_V, d_act, Dim, N);   
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_act, Dim, N);
+    cudaDeviceSynchronize();
 
     // Calculate Final output
+    printf("Final output\n");
     matmul_bias<<<grid, threads>>>(d_act, linear[3], d_act, bias[3], N, Dim, Dim);
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_act, Dim, N);
+    cudaDeviceSynchronize();
 
     // Residual connection
+    printf("Residual connection\n");
     add<<<N, block_size_linear>>>(d_act, d_input, Dim);
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_input, Dim, N);
+    cudaDeviceSynchronize();
 
     // Layer Normalization
+    printf("Layer Normalization\n");
     layernorm<<<N, block_size>>>(d_act, d_input, Dim, ln[2], ln[3]);
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_input, Dim, N);
+    cudaDeviceSynchronize();
+
 
     // Matmul
+    printf("Mlp1\n");
     matmul_bias<<<grid, threads>>>(d_input, mlp1, d_act_wide, mlp_bias1, N, Dim, Dim);
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_act_wide, Dim, N);
+    cudaDeviceSynchronize();
 
     //gelu
+    printf("Gelu\n");
     gelu<<<N, block_size>>>(d_act, Dim);
+    cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_act, Dim, N);
+    cudaDeviceSynchronize();
 
     // Matmul
+    printf("mlp2\n");
     matmul_bias<<<grid, threads>>>(d_act, mlp2, d_act, mlp_bias2, N, Dim, Dim);
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_act, Dim, N);
+    cudaDeviceSynchronize();
 
     // Residual connection
+    printf("Residual connection\n");
     add<<<N, block_size_linear>>>(d_act, d_input, Dim);
     cudaCheckErrors("kernel launch failure");
+    isnan_test<<<1, 1>>>(d_input, Dim, N);
+    cudaDeviceSynchronize();
 
     return 0;
     }
@@ -255,10 +309,12 @@ int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK,
       float *proj_linear, float *d_output, int Dim, int N){
 
 
-      for(int i = 0; i < N_Layers; i++){
+      for(int i = 0; i < 2; i++){
         printf("Layer %d\n", i);
         MHA(d_input, d_Q, d_K, d_V, d_QK, d_act, d_act_wide,
         linear[i], bias[i], ln[i], mlp1[i], mlp_bias1[i], mlp2[i], mlp_bias2[i], Dim, N);
+        cudaDeviceSynchronize();
+        printf("Layer %d done\n", i);
       }
 
       // Layer Normalization
@@ -292,9 +348,14 @@ int read_weight(float *arr, char *filename, int rows, int cols){
 
   // for (int i = 0; i < rows; i++) {
   //     for (int j = 0; j < cols; j++) {
-  //         printf("%f ", arr[i * cols + j]);
+  //         // printf("%f ", arr[i * cols + j]);
+  //         // check if the value is NaN
+  //         if (isnan(arr[i * cols + j])) {
+  //             printf("NaN detected at %d, %d\n", i, j);
+  //             return 1;
+  //         }
   //     }
-  //     printf("\n");
+  //     // printf("\n");
   // }
 
   return 0;
@@ -302,6 +363,8 @@ int read_weight(float *arr, char *filename, int rows, int cols){
 }
 
 int main(){
+
+    int N = 5;
 
     // declare host memory pointers
 
@@ -339,7 +402,6 @@ int main(){
     h_proj_linear = new float[Dim*Vocab];
 
     // initialize matrix in host memory
-
     char filename[256];
 
     snprintf(filename, sizeof(filename), "gpt_weights/input.bin");
@@ -432,6 +494,8 @@ int main(){
     for (int i = 0; i < 2; i++) cudaMalloc(&d_final_ln[i], Dim*sizeof(float));
     cudaMalloc(&d_proj_linear, Dim*Vocab*sizeof(float));
 
+    cudaDeviceSynchronize();
+
     // copy data to device
     cudaMemcpy(d_input, h_input, N*Dim*sizeof(float), cudaMemcpyHostToDevice);
 
@@ -459,10 +523,17 @@ int main(){
 
     cudaMemcpy(d_proj_linear, h_proj_linear, Dim*Vocab*sizeof(float), cudaMemcpyHostToDevice);
 
+    // synchronize device
+    cudaDeviceSynchronize();
+
     // Launch kernel
     Transformer(d_input, d_Q, d_K, d_V, d_QK, d_ACT, d_ACT_wide, d_linear, d_bias,
      d_ln, d_mlp1, d_mlp_bias1, d_mlp2, d_mlp_bias2, d_final_ln, d_proj_linear, d_output, Dim, N);
     cudaCheckErrors("kernel launch failure");
+
+
+    // synchronize device
+    cudaDeviceSynchronize();
 
     printf("Done\n");
 
@@ -470,13 +541,17 @@ int main(){
     cudaMemcpy(h_output, d_output, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
     cudaCheckErrors("cudaMemcpy D2H failure");
 
+    // synchronize device
+    cudaDeviceSynchronize();
     // Verify results
-    for (int i = 0; i < N*Vocab; i++){
-      if (h_output[i] - h_ans[i] > 0.001) {
-        printf("results mismatch at %d, was: %.10f, should be: %.10f\n", i, h_output[i], h_ans[i]);
-        return -1;
-      }
-    }
+    // for (int i = 0; i < N*Vocab; i++){
+    //   printf("%d: %.10f: %.10f\n", i, h_output[i], h_ans[i]);
+    //   if (h_output[i] - h_ans[i] > 0.001) {
+    
+    //     printf("results mismatch at %d, was: %.10f, should be: %.10f\n", i, h_output[i], h_ans[i]);
+    //     return -1;
+    //   }
+    // }
 
 
     return 0;

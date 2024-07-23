@@ -14,13 +14,10 @@
     } while (0)
 
 
-const int N = 2048;      // matrix side dimension
-const int Dim = 2048;
+const int N = 6;      // matrix side dimension
+const int Dim = 1024;
 const int block_size = 32;  // CUDA maximum is 1024 *total* threads in block  
 const int block_size_softmax = 1024;  // CUDA maximum is 1024 *total* threads in block
-
-
-
 
 
 __global__ void softmax(float *QK, size_t ds){
@@ -29,6 +26,26 @@ __global__ void softmax(float *QK, size_t ds){
   __shared__ float sdata[block_size_softmax];
   sdata[idx] = 0.0f;
   float val = 0;
+
+  __shared__ float max_val;
+  max_val = 0.0f;
+
+  // Find the maximum value in the block
+
+  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
+    if (index < ds*ds) sdata[idx] = max(A[index], sdata[idx]);
+  }
+
+  for(int s = blockDim.x/2; s > 0; s/=2){
+    __syncthreads();
+    if (idx < s) sdata[idx] = max(sdata[idx], sdata[idx + s]);
+  }
+  __syncthreads();
+
+  if (idx == 0) max_val = sdata[0];
+  __syncthreads();
+
+  sdata[idx] = 0.0f;
 
   for(int i = 0; i < ds/blockDim.x; i++){
     val = expf(QK[ds*blockIdx.x + i*blockDim.x + idx]);
@@ -40,10 +57,56 @@ __global__ void softmax(float *QK, size_t ds){
     __syncthreads();
     if (idx < s) sdata[idx] += sdata[idx + s];
   }
+  __syncthreads();
   
   for(int i = 0; i < ds/blockDim.x; i++) QK[ds*blockIdx.x + i*blockDim.x + idx] /= sdata[0];
+
+  if(idx == 0) printf("sdata[0]: %f\n", sdata[0]);
   
 }
+
+__global__ void softmax_max(float *A, size_t ds){
+
+  int idx = threadIdx.x;
+  __shared__ float sdata[block_size_softmax];
+  sdata[idx] = 0.0f;
+  float val = 0.0f;
+  float max_val = 0.0f;
+
+  for(int i = 0; i < ds/blockDim.x; i++){
+    sdata[idx] = max(A[ds*blockIdx.x + i*blockDim.x + idx], sdata[idx]);
+  }
+
+  for(int s = blockDim.x/2; s > 0; s/=2){
+    __syncthreads();
+    if (idx < s) sdata[idx] = max(sdata[idx], sdata[idx + s]);
+  }
+  __syncthreads();
+
+  if (idx == 0) max_val = sdata[0];
+  sdata[idx] = 0.0f;
+
+  __syncthreads();
+
+  for(int i = 0; i < ds/blockDim.x; i++){
+    val = expf(A[ds*blockIdx.x + i*blockDim.x + idx] - max_val);
+    A[ds*blockIdx.x + i*blockDim.x + idx] = val;
+    sdata[idx] += val;
+  }
+
+  for(int s = blockDim.x/2; s > 0; s/=2){
+    __syncthreads();
+    if (idx < s) sdata[idx] += sdata[idx + s];
+  }
+  __syncthreads();
+  
+  for(int i = 0; i < ds/blockDim.x; i++) A[ds*blockIdx.x + i*blockDim.x + idx] /= sdata[0];
+
+  if (idx == 0) printf("A: %f\n", A[ds*blockIdx.x]);
+  
+
+}
+
 
 __global__ void matmul(const float *Attn, const float *V, float *C, int Dim, int N) {
 
@@ -125,7 +188,6 @@ int validateQK_V(float *h_QK, float *h_V, float *h_ACT, int N, int Dim){
 
 
   for(int i = 0; i < N; i++) for (int j = 0; j < N; j++) h_QK[i*N+j] /= sums[i];
-  
 
   for (int i = 0; i < N; i++){
     for (int j = 0; j < Dim; j++){
@@ -143,14 +205,44 @@ int validateQK_V(float *h_QK, float *h_V, float *h_ACT, int N, int Dim){
   return 0;
 }
 
+int validateSoftmax(float *h_QK, float *h_sout, int N){
+
+  float sums[N];
+  for (int i = 0; i < N; i++) sums[i] = 0;
+
+  for (int i = 0; i < N; i++){
+    for (int j = 0; j < N; j++){
+      h_QK[i*N+j] = expf(h_QK[i*N+j]);
+      sums[i] += h_QK[i*N+j];
+    }
+  }
+
+
+  for(int i = 0; i < N; i++) for (int j = 0; j < N; j++) h_QK[i*N+j] /= sums[i];
+
+
+  for (int i = 0; i < N; i++){
+    for (int j = 0; j < N; j++){
+      if (h_QK[i*N+j] - h_sout[i*N+j] > 0.001) {
+        printf("results mismatch at %d, was: %f, should be: %f\n", i*N+j, h_sout[i*N+j], h_QK[i*N+j]);
+        return -1;
+      }
+    }
+  }
+
+  printf("softmax correct!\n");
+  return 0;
+}
+
 int main(){
 
-    float *h_QK, *h_V, *h_ACT;
+    float *h_QK, *h_V, *h_ACT, *h_sout;
     float *d_QK, *d_V, *d_ACT;
 
     h_QK = new float[N*N];
     h_V = new float[N*Dim];
     h_ACT = new float[N*Dim];
+    h_sout = new float[N*N];
 
     for (int i = 0; i < N*N; i++) h_QK[i] = rand()/(float)RAND_MAX;
     for (int i = 0; i < N*Dim; i++) h_V[i] = rand()/(float)RAND_MAX;
@@ -171,23 +263,28 @@ int main(){
 
     
     dim3 block(block_size, block_size);
-    dim3 grid((Dim+block.x-1)/block.x, (N+block.y-1)/block.y);
+    dim3 grid((Dim+block.x-1)/block.x, (Dim+block.y-1)/block.y);
 
     // Fused QK_V
-    QK_V<<<grid, block>>>(d_QK, d_V, d_ACT, Dim, N);
+    // QK_V<<<grid, block>>>(d_QK, d_V, d_ACT, Dim, N);
 
     // // Softmax + QK_V
-    // dim3 block2(block_size_softmax); 
-    // dim3 grid2((N+block.x-1)/block.x);
-    // softmax<<<grid2, block2>>>(d_QK, N);
-    // matmul<<<grid, block>>>(d_QK, d_V, d_ACT, Dim, N);
     
+    softmax<<<N, block_size_softmax>>>(d_QK, Dim);
     cudaCheckErrors("kernel launch failure");
 
-    cudaMemcpy(h_ACT, d_ACT, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sout, d_QK, N*N*sizeof(float), cudaMemcpyDeviceToHost);
     cudaCheckErrors("cudaMemcpy D2H failure");
 
-    // Vlaidate softmax(QK)*V
+    validateSoftmax(h_QK, h_sout, N);
+
+    // matmul<<<grid, block>>>(d_QK, d_V, d_ACT, Dim, N);
+    // cudaCheckErrors("kernel launch failure");
+
+    // cudaMemcpy(h_ACT, d_ACT, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaCheckErrors("cudaMemcpy D2H failure");
+
+    // // Validate softmax(QK)*V
     // validateQK_V(h_QK, h_V, h_ACT, N, Dim);
 
     return 0;

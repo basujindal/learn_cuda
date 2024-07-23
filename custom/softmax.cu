@@ -14,84 +14,141 @@
     } while (0)
 
 
-const size_t DSIZE = 16384;      // matrix side dimension
-// const size_t DSIZE = 1024;      // matrix side dimension
-const int block_size = 1024;  // CUDA maximum is 1024
-const float element_val = 5;
+// const size_t DSIZE = 16384;      // matrix side dimension
+const size_t DSIZE = 6;      // matrix side dimension
+const int block_size = 32;  // CUDA maximum is 1024
+const float element_val = 500;
 
 
-__global__ void softmax(float *A, float *sums, size_t ds){
+__global__ void softmax_max(float *A, size_t ds) {
+  int idx = threadIdx.x;
+  __shared__ float sdata[block_size];  // Make sure block_size is defined somewhere as blockDim.x
+  sdata[idx] = 0.0f;
+  float val = 0.0f;
+
+  // Total elements this block is supposed to handle
+  int total_elements = ds * ds;
+  int start_index = blockIdx.x * ds; // Start index for this block
+  int end_index = start_index + ds;  // End index for this block
+
+  __shared__ float max_val;
+  max_val = 0.0f;
+
+  // Find the maximum value in the block
+
+  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
+    if (index < ds*ds) sdata[idx] = max(A[index], sdata[idx]);
+  }
+
+  for(int s = blockDim.x/2; s > 0; s/=2){
+    __syncthreads();
+    if (idx < s) sdata[idx] = max(sdata[idx], sdata[idx + s]);
+  }
+  __syncthreads();
+
+  if (idx == 0) max_val = sdata[0];
+  __syncthreads();
+
+  sdata[idx] = 0.0f;
+
+  // Process elements
+  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
+    if (index < total_elements) {
+      val = expf(A[index] - max_val);
+      A[index] = val;
+      atomicAdd(&sdata[idx], val);
+    }
+  }
+
+  __syncthreads();
+
+  // Sum reduction in shared memory
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (idx < s) {
+      sdata[idx] += sdata[idx + s];
+    }
+    __syncthreads();
+  }
+
+  // Normalize the values
+  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
+    if (index < total_elements) {
+      A[index] /= sdata[0];
+    }
+  }
+}
+
+
+__global__ void softmax_max(float *A, size_t ds){
+
 
   int idx = threadIdx.x;
   __shared__ float sdata[block_size];
   sdata[idx] = 0.0f;
-  float val;
+  float val = 0.0f;
+
+  __shared__ float max_val;
+  max_val = 0.0f;
 
   for(int i = 0; i < ds/blockDim.x; i++){
-    val = expf(A[ds*blockIdx.x + i*blockDim.x + idx]);
+    sdata[idx] = max(A[ds*blockIdx.x + i*blockDim.x + idx], sdata[idx]);
+  }
+
+  for(int s = blockDim.x/2; s > 0; s/=2){
+    __syncthreads();
+    if (idx < s) sdata[idx] = max(sdata[idx], sdata[idx + s]);
+  }
+
+  if (idx == 0) max_val = sdata[0];
+  __syncthreads();
+
+  sdata[idx] = 0.0f;
+  
+  for(int i = 0; i < ds/blockDim.x; i++){
+    val = expf(A[ds*blockIdx.x + i*blockDim.x + idx] - max_val);
     A[ds*blockIdx.x + i*blockDim.x + idx] = val;
     sdata[idx] += val;
   }
+
 
   for(int s = blockDim.x/2; s > 0; s/=2){
     __syncthreads();
     if (idx < s) sdata[idx] += sdata[idx + s];
   }
-  
-  if (idx == 0) sums[blockIdx.x] = sdata[0];
+
+  __syncthreads();
   
   for(int i = 0; i < ds/blockDim.x; i++) A[ds*blockIdx.x + i*blockDim.x + idx] /= sdata[0];
-  
 
 }
 
-bool validate(float *data, size_t sz){
-  
-  for (size_t i = 0; i < sz; i++){
-    // printf("%f\n", expf(0.005)*(float)sz);
-    float val = expf(element_val)*(float)sz;
-    if (data[i] - val > 0.001) {printf("results mismatch at %lu, was: %f, should be: %f\n", i, data[i], val); return false;}
-  }
-    return true;
-}
+
 int main(){
 
-  float *h_A, *d_A, *d_sums;
-  h_A = new float[DSIZE*DSIZE];  // allocate space for data in host memory
-  // h_sums = new float[DSIZE]();
-  for (int i = 0; i < DSIZE*DSIZE; i++)  // initialize matrix in host memory
-    h_A[i] = element_val;
-  cudaMalloc(&d_A, DSIZE*DSIZE*sizeof(float));  // allocate device space for A
-  cudaMalloc(&d_sums, DSIZE*sizeof(float));  // allocate device space for vector d_sums
+  float *h_A, *d_A;
+  h_A = new float[DSIZE*DSIZE];  
 
-  cudaCheckErrors("cudaMalloc failure"); // error checking
+  for (int i = 0; i < DSIZE*DSIZE; i++) h_A[i] = element_val;
+
+  cudaMalloc(&d_A, DSIZE*DSIZE*sizeof(float)); 
+  cudaCheckErrors("cudaMalloc failure");
+
   cudaMemcpy(d_A, h_A, DSIZE*DSIZE*sizeof(float), cudaMemcpyHostToDevice);
   cudaCheckErrors("cudaMemcpy H2D failure");
 
-  //row_sums<<<DSIZE, block_size>>>(d_A, d_sums, DSIZE);
-  softmax<<<DSIZE, block_size>>>(d_A, d_sums, DSIZE);
+  softmax<<<DSIZE, block_size>>>(d_A, DSIZE);
   cudaCheckErrors("kernel launch failure");
-
-  // cudaMemcpy(h_sums, d_sums, DSIZE*sizeof(float), cudaMemcpyDeviceToHost);
-  // cudaCheckErrors("1 kernel execution failure or cudaMemcpy H2D failure");
-
-  // if (!validate(h_sums, DSIZE)) return -1; 
-  // printf("row sums correct!\n");
 
   cudaMemcpy(h_A, d_A, DSIZE*DSIZE*sizeof(float), cudaMemcpyDeviceToHost);
   cudaCheckErrors("cudaMemcpy D2H failure");
 
-  printf("%.15f\n", h_A[312192]);
-
   for(int i = 0; i < DSIZE*DSIZE; i++){
-    // printf("%f\n %f\n", h_A[i], 1/(float)DSIZE);
-    if(h_A[i] - 1/(float)DSIZE > 0.00001
+    // printf("h_A[%d]: %.8f\n", i, h_A[i]);
+    if(abs(h_A[i] - 1/(float)DSIZE) > 0.00001
     ) {printf("results mismatch at %d, was: %.10f, should be: %.10f\n", i, h_A[i], 1/float(DSIZE)); return -1;}
   }
     printf("softmax correct!\n");
     
-
-
   return 0;
 }
   
