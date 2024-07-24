@@ -17,12 +17,13 @@
 // const size_t DSIZE = 16384;      // matrix side dimension
 const size_t DSIZE = 6;      // matrix side dimension
 const int block_size = 32;  // CUDA maximum is 1024
-const float element_val = 500;
+const float element_val = 100;
 
 
 __global__ void softmax_max(float *A, size_t ds) {
+
   int idx = threadIdx.x;
-  __shared__ float sdata[block_size];  // Make sure block_size is defined somewhere as blockDim.x
+  __shared__ float sdata[block_size];
   sdata[idx] = 0.0f;
   float val = 0.0f;
 
@@ -79,49 +80,6 @@ __global__ void softmax_max(float *A, size_t ds) {
 }
 
 
-__global__ void softmax_max(float *A, size_t ds){
-
-
-  int idx = threadIdx.x;
-  __shared__ float sdata[block_size];
-  sdata[idx] = 0.0f;
-  float val = 0.0f;
-
-  __shared__ float max_val;
-  max_val = 0.0f;
-
-  for(int i = 0; i < ds/blockDim.x; i++){
-    sdata[idx] = max(A[ds*blockIdx.x + i*blockDim.x + idx], sdata[idx]);
-  }
-
-  for(int s = blockDim.x/2; s > 0; s/=2){
-    __syncthreads();
-    if (idx < s) sdata[idx] = max(sdata[idx], sdata[idx + s]);
-  }
-
-  if (idx == 0) max_val = sdata[0];
-  __syncthreads();
-
-  sdata[idx] = 0.0f;
-  
-  for(int i = 0; i < ds/blockDim.x; i++){
-    val = expf(A[ds*blockIdx.x + i*blockDim.x + idx] - max_val);
-    A[ds*blockIdx.x + i*blockDim.x + idx] = val;
-    sdata[idx] += val;
-  }
-
-
-  for(int s = blockDim.x/2; s > 0; s/=2){
-    __syncthreads();
-    if (idx < s) sdata[idx] += sdata[idx + s];
-  }
-
-  __syncthreads();
-  
-  for(int i = 0; i < ds/blockDim.x; i++) A[ds*blockIdx.x + i*blockDim.x + idx] /= sdata[0];
-
-}
-
 
 int main(){
 
@@ -136,14 +94,14 @@ int main(){
   cudaMemcpy(d_A, h_A, DSIZE*DSIZE*sizeof(float), cudaMemcpyHostToDevice);
   cudaCheckErrors("cudaMemcpy H2D failure");
 
-  softmax<<<DSIZE, block_size>>>(d_A, DSIZE);
+  softmax_max<<<DSIZE, block_size>>>(d_A, DSIZE);
   cudaCheckErrors("kernel launch failure");
 
   cudaMemcpy(h_A, d_A, DSIZE*DSIZE*sizeof(float), cudaMemcpyDeviceToHost);
   cudaCheckErrors("cudaMemcpy D2H failure");
 
   for(int i = 0; i < DSIZE*DSIZE; i++){
-    // printf("h_A[%d]: %.8f\n", i, h_A[i]);
+    printf("h_A[%d]: %.8f\n", i, h_A[i]);
     if(abs(h_A[i] - 1/(float)DSIZE) > 0.00001
     ) {printf("results mismatch at %d, was: %.10f, should be: %.10f\n", i, h_A[i], 1/float(DSIZE)); return -1;}
   }
