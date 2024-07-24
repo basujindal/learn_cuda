@@ -1,10 +1,8 @@
 ## To Do
 
-- [ ] Convert to MHA
-- [ ] Check variable length input
+- [ ] Check input 64, 65, 768, 769, 1024, 1024
+- [ ] Create for loop
+- [ ] remove syncthreads
 
- - [ ] Attn bias?
-- [ ] Dropout
-- [ ] Embedding Layer + Positional Encoding
-
-- [ ] Make softmax stable by substracting the maximum value from the input array
+- [ ] Optimize the hell out of it
+- [ ] Add cpp tokenizer
