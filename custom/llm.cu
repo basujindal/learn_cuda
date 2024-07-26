@@ -23,7 +23,7 @@ const int N_Layers = 12;
 const int Vocab_OG = 50257;
 const int Vocab = 50272;
 const int num_heads = 12;
-int num_new_tokens = 1;
+int num_new_tokens = 35;
 
 
 __global__ void softmax_max(float *A, size_t ds) {
@@ -268,15 +268,15 @@ __global__ void scale(float *A, int N, int head_dim){
 __global__ void set_inf(float *A, int dim, int N, int N_tokens){
 
     int idx = threadIdx.x;
-
+    int NEG_INF = -50;
     if(blockIdx.x < N_tokens){
       for(int i = 0; i < dim/blockDim.x; i++){
           if (i*blockDim.x + idx < N_tokens &&  i*blockDim.x + idx < blockIdx.x+1) continue;
-          A[dim*blockIdx.x + i*blockDim.x + idx] = -100;
+          A[dim*blockIdx.x + i*blockDim.x + idx] = NEG_INF;
         }
     }
     else{
-      for(int i = 0; i < dim/blockDim.x; i++) A[dim*blockIdx.x + i*blockDim.x + idx] = -100;
+      for(int i = 0; i < dim/blockDim.x; i++) A[dim*blockIdx.x + i*blockDim.x + idx] = NEG_INF;
     }
 }
 
@@ -302,8 +302,8 @@ __global__ void isnan_test(float *data, int width, int height){
 
   while (idx < width){
     for (int i = 0; i < height; i++){
-      if (isnan(data[(i*width) + idx])){
-        printf("NAN at %d, %d\n", i, idx);
+      if (isnan(data[(i*width) + idx]) || isinf(data[(i*width) + idx])){
+        printf("NAN or INF at %d, %d\n", i, idx);
         return;
       }
     }
@@ -317,13 +317,22 @@ __global__ void matmul_mha_transpose(const float *A, const float *B, float *C, i
   __shared__ float As[block_size][block_size];
   __shared__ float Bs[block_size][block_size];
 
+  // if(threadIdx.x == 0 && threadIdx.y == 0) printf("head_num %d %d\n", blockIdx.x, blockIdx.y);
+
   int col = threadIdx.x+blockDim.x*blockIdx.x;
   int row = threadIdx.y+blockDim.y*blockIdx.y;
+  // printf("%d %d\n", row, col);
+  
 
   if ((row < height) && (col < width)){
+    // if(row == 8 && col == 8) printf("final %d %d\n", row, col);
+  
     float temp = 0;
     for (int i = 0; i < head_dim/block_size; i++) {
 
+      // if(col*dim + (block_size*i + threadIdx.y + head_dim*head_num) > 768*32){
+        // printf("row %d, col %d, i %d, head_num %d head_dim %d\n", row, col, i, head_num, head_dim);
+      // }
       // Load data into shared memory
       As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x + head_dim*head_num)];
       Bs[threadIdx.y][threadIdx.x] = B[col*dim + (block_size*i + threadIdx.y + head_dim*head_num)];
@@ -337,6 +346,7 @@ __global__ void matmul_mha_transpose(const float *A, const float *B, float *C, i
       __syncthreads();
 
     }
+    
     C[row*width+col] = temp;
   }
 }
@@ -349,6 +359,9 @@ __global__ void matmul_mha(const float *A, const float *B, float *C, int height,
   // declare cache in shared memory
   __shared__ float As[block_size][block_size];
   __shared__ float Bs[block_size][block_size];
+
+  // As[threadIdx.y][threadIdx.x] = 0.0f;
+  // Bs[threadIdx.y][threadIdx.x] = 0.0f;
 
   int row = threadIdx.y+blockDim.y*blockIdx.y;
   int col = threadIdx.x+blockDim.x*blockIdx.x + head_dim*head_num;
@@ -404,16 +417,7 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     matmul_bias<<<grid, threads>>>(d_act, linear[1], d_K, bias[1], N, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     isnan_test<<<1, 1>>>(d_K, Dim, N);
-    cudaDeviceSynchronize();
-
-    // cudaMemcpy(h_output, d_K, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
-    // cudaCheckErrors("cudaMemcpy D2H failure");
-
-    // for(int k = 0; k < N_tokens; k++){
-    //   for(int j = 0; j < Dim; j++)printf("%f ", h_output[k*Dim + j]);
-    //   printf("\n");
-    // }
-    
+    cudaDeviceSynchronize();    
 
     // printf("V\n");
     matmul_bias<<<grid, threads>>>(d_act, linear[2], d_V, bias[2], N, Dim, Dim, N_tokens);
@@ -422,18 +426,36 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     cudaDeviceSynchronize();
 
     int head_dim = Dim/num_heads;
-    dim3 grid_mha((head_dim + threads.x - 1)/block_size, (N + threads.y - 1)/block_size);
+    dim3 grid_mha((Dim + threads.y - 1)/block_size, (N + threads.x - 1)/block_size);
+
+    dim3 grid_mha_transpose((N + threads.y - 1)/block_size, (N + threads.x - 1)/block_size);
+
     // printf("grid %d, %d\n", grid_mha.x, grid_mha.y);
 
     for (int i = 0; i < num_heads; i++){
+      // int zz = 11;
 
       // Calculate QK.T
       // printf("QK\n"); 
-      matmul_mha_transpose<<<grid_mha, threads>>>(d_Q, d_K, d_QK, N, N, Dim, head_dim, i);
+      matmul_mha_transpose<<<grid_mha_transpose, threads>>>(d_Q, d_K, d_QK, N, N, Dim, head_dim, i);
       cudaCheckErrors("kernel launch failure");
       isnan_test<<<1, 1>>>(d_QK, N, N);
       cudaDeviceSynchronize();
 
+      // printf("QK\n");
+      // cudaDeviceSynchronize();
+      // if(i == zz){
+      //   cudaMemcpy(h_test, d_QK, N*N*sizeof(float), cudaMemcpyDeviceToHost);
+      //   cudaCheckErrors("cudaMemcpy D2H failure");
+      //   for(int k = 0; k < N_tokens+1; k++){
+      //     printf("token %d ", k);
+      //     for(int j = 0; j < N_tokens+1; j++)printf("%.3f ", h_test[k*N + j]);
+      //     printf("\n");
+      //   }
+      //   printf("\n\n");
+      // }
+
+      
       // scale by sqrt(d_k)
       // printf("Scale\n");
       scale<<<N, block_size>>>(d_QK, N, head_dim);
@@ -462,22 +484,56 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
       isnan_test<<<1, 1>>>(d_QK, N, N);
       cudaDeviceSynchronize();
 
+      // printf("softmax\n");
+      // cudaDeviceSynchronize();
+      // if(i == zz){
+      //   cudaMemcpy(h_test, d_QK, N*N*sizeof(float), cudaMemcpyDeviceToHost);
+      //   cudaCheckErrors("cudaMemcpy D2H failure");
+      //   for(int k = 0; k < N_tokens+1; k++){
+      //     printf("token %d ", k);
+      //     for(int j = 0; j < N_tokens+1; j++)printf("%.3f ", h_test[k*N + j]);
+      //     printf("\n");
+      //   }
+      //   printf("\n\n");
+      // }
+
       // printf("QK_V\n");
       matmul_mha<<<grid_mha, threads>>>(d_QK, d_V, d_act, N, head_dim, N, head_dim, i, Dim);
       cudaCheckErrors("kernel launch failure");
       isnan_test<<<1, 1>>>(d_act, head_dim, N);
       cudaDeviceSynchronize();
 
+      // printf("QKV\n");
+      // cudaDeviceSynchronize();
+      // if(i == zz){
+      // cudaMemcpy(h_test, d_act, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+      // cudaCheckErrors("cudaMemcpy D2H failure");
+      // for(int k = 0; k < N_tokens; k++){
+      //   printf("token %d ", k);
+      //   for(int j = head_dim*zz; j < head_dim*zz+10; j++)printf("%.5f ", h_test[k*Dim + j]);
+      //   printf("\n");
+      // }
+      // printf("\n\n");
+      // }
+
     }
     cudaDeviceSynchronize();
 
-    // Calculate Final output
     // printf("Final output\n");
     matmul_bias<<<grid, threads>>>(d_act, linear[3], d_act2, bias[3], N, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     isnan_test<<<1, 1>>>(d_act, Dim, N);
     cudaDeviceSynchronize();
-      
+
+    // cudaDeviceSynchronize();
+    // cudaMemcpy(h_test, d_act2, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaCheckErrors("cudaMemcpy D2H failure");
+    // for(int k = 0; k < N_tokens; k++){
+    //   printf("token %d ", k);
+    //   for(int j = 0; j < 10; j++)printf("%.5f ", h_test[k*Dim + j]);
+    //   printf("\n");
+    // }
+    // printf("\n\n");
 
     // Residual connection
     // printf("Residual connection\n");
@@ -486,12 +542,31 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     isnan_test<<<1, 1>>>(d_input, Dim, N);
     cudaDeviceSynchronize();
 
+    // cudaDeviceSynchronize();
+    // cudaMemcpy(h_test, d_input, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaCheckErrors("cudaMemcpy D2H failure");
+    // for(int k = 0; k < N_tokens; k++){
+    //   printf("token %d ", k);
+    //   for(int j = 0; j < 10; j++)printf("%.5f ", h_test[k*Dim + j]);
+    //   printf("\n");
+    // }
+    // printf("\n\n");
+
     // Layer Normalization
     // printf("Layer Normalization\n");
     layernorm<<<N_tokens, block_size>>>(d_input, d_act, Dim, ln[2], ln[3]);
     cudaCheckErrors("kernel launch failure");
     isnan_test<<<1, 1>>>(d_input, Dim, N);
     cudaDeviceSynchronize();
+
+    // cudaMemcpy(h_test, d_act, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaCheckErrors("cudaMemcpy D2H failure");
+    // for(int k = 0; k < N_tokens; k++){
+    //   printf("token %d ", k);
+    //   for(int j = 0; j < 10; j++)printf("%.5f ", h_test[k*Dim + j]);
+    //   printf("\n");
+    // }
+    // printf("\n\n");
 
     dim3 grid_wide((4*Dim + threads.x - 1)/block_size, (N + threads.y - 1)/block_size);
     // Matmul
@@ -501,12 +576,33 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     isnan_test<<<1, 1>>>(d_act_wide, Dim, N);
     cudaDeviceSynchronize();
 
+    // cudaMemcpy(h_test, d_act_wide, 4*N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaCheckErrors("cudaMemcpy D2H failure");
+    // for(int k = 0; k < N_tokens; k++){
+    //   printf("token %d ", k);
+    //   for(int j = 0; j < 10; j++)printf("%.5f ", h_test[k*4*Dim + j]);
+    //   printf("\n");
+    // }
+    // printf("\n\n");
+
+
     //gelu
     // printf("Gelu\n");
-    gelu<<<N, block_size>>>(d_act_wide, Dim);
+    gelu<<<N, block_size>>>(d_act_wide, 4*Dim);
     cudaCheckErrors("kernel launch failure");
     isnan_test<<<1, 1>>>(d_act, 4*Dim, N);
     cudaDeviceSynchronize();
+
+
+    // cudaMemcpy(h_test, d_act_wide, 4*N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaCheckErrors("cudaMemcpy D2H failure");
+    // for(int k = 0; k < N_tokens; k++){
+    //   printf("token %d ", k);
+    //   for(int j = 0; j < 10; j++)printf("%.5f ", h_test[k*4*Dim + j]);
+    //   printf("\n");
+    // }
+    // printf("\n\n");
+
 
     // Matmul
     // printf("mlp2\n");
@@ -514,6 +610,15 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     cudaCheckErrors("kernel launch failure");
     isnan_test<<<1, 1>>>(d_act, Dim, N);
     cudaDeviceSynchronize();
+
+    // cudaMemcpy(h_test, d_act, N*Dim*sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaCheckErrors("cudaMemcpy D2H failure");
+    // for(int k = 0; k < N_tokens; k++){
+    //   printf("token %d ", k);
+    //   for(int j = 0; j < 10; j++)printf("%.5f ", h_test[k*Dim + j]);
+    //   printf("\n");
+    // }
+    // printf("\n\n");
 
     // Residual connection
     // printf("Residual connection\n");
@@ -586,8 +691,8 @@ void position_encoding(float *arr, int Dim, int N){
 int main(){
 
     int N = 32;
-    int N_tokens = 10;
-    int text[] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101, 257}; // 257
+    int N_tokens = 9;
+    int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101}; // 257
     // int N_tokens = 8;
     // int text[] = {15496,    11,   616,  1438,   318,  1757,    13,   314};
 
@@ -613,7 +718,7 @@ int main(){
     h_emb = new float[Dim*Vocab_OG];
     h_input2 = new float[N*Dim];
 
-    float* h_test = new float[Dim*N];
+    float* h_test = new float[4*N*Dim];
 
     for (int i = 0; i < N_Layers; i++){
 
@@ -804,9 +909,10 @@ int main(){
       // synchronize device
       cudaDeviceSynchronize();
 
-      // Copy results back to host
+      // // Copy results back to host
       cudaMemcpy(h_output, d_output, N*Vocab*sizeof(float), cudaMemcpyDeviceToHost);
       cudaCheckErrors("cudaMemcpy D2H failure");
+
 
       // cudaDeviceSynchronize();
       // for (int i = 0; i < N; i++){
@@ -830,7 +936,7 @@ int main(){
           new_token = j;
         }
       }
-      printf("Max value index: %d\n", new_token);
+      printf("%d,", new_token);
 
     // add the new token to the input
     for (int i = 0; i < N; i++){
