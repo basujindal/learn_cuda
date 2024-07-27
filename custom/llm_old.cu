@@ -389,13 +389,6 @@ __global__ void matmul_mha(const float *A, const float *B, float *C, int height,
   }
 }
 
-
-// // add the new token to the input
-// for (int j = 0; j < Dim; j++)
-// h_input[N_tokens*Dim + j] = h_emb[new_token[0]*Dim + j] + h_pos[N_tokens*Dim + j];
-
-
-
 int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *d_act, float *d_act_wide,
       float *linear[4], float *bias[4], float *ln[], float *mlp1, float *mlp_bias1, float *mlp2, float *mlp_bias2,
       int Dim, int N, int N_tokens, float *h_output, float *h_test, float *d_act2){
@@ -574,25 +567,15 @@ __global__ void max_index(float *A, size_t height, size_t width, int *max_idx) {
   
 }
 
-// set all values to -infinity except for N_tokens*N_tokens block
-__global__ void set_new_embedding(float *A, int dim, int N_tokens, float *emb, int *new_token, float *pos){
-
-    int idx = threadIdx.x;
-    for(int i = 0; i < dim/blockDim.x; i++) 
-    A[dim*N_tokens + i*blockDim.x + idx] = emb[new_token[0]*dim + i*blockDim.x + idx] + pos[N_tokens*dim + i*blockDim.x + idx];
-    
-}
-
-
 int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *d_act, float *d_act_wide,
       float *linear[N_Layers][4], float *bias[N_Layers][4], float *ln[N_Layers][4], float *mlp1[N_Layers],
       float *mlp_bias1[N_Layers], float *mlp2[N_Layers], float *mlp_bias2[N_Layers], float *ln_final[2],
       float *proj_linear, float *d_output, int Dim, int N, int N_tokens, float *h_output, 
-      float *h_test, float *d_act2, int *d_max_idx, int *new_token, float *d_emb, float *d_pos, float *d_input2){
+      float *h_test, float *d_act2, int *d_max_idx, int *new_token){
 
-      cudaMemcpy(d_input2, d_input, N_tokens*Dim*sizeof(float), cudaMemcpyDeviceToDevice);
 
       for(int i = 0; i < 12; i++){
+        // printf("Layer %d\n", i);
 
         MHA(d_input, d_Q, d_K, d_V, d_QK, d_act, d_act_wide,
         linear[i], bias[i], ln[i], mlp1[i], mlp_bias1[i], mlp2[i], mlp_bias2[i],
@@ -605,7 +588,6 @@ int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK,
       // Layer Normalization
       layernorm<<<N_tokens, block_size>>>(d_input, d_input, Dim, ln_final[0], ln_final[1]);
       cudaCheckErrors("kernel launch failure");
-      cudaDeviceSynchronize();
 
       dim3 threads(block_size, block_size);
       dim3 grid((Vocab + block_size - 1)/block_size, (Dim + block_size - 1)/block_size);
@@ -613,17 +595,10 @@ int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK,
       // Matmul
       matmul<<<grid, threads>>>(d_input, proj_linear, d_output, N, Vocab, Dim);
       cudaCheckErrors("kernel launch failure");
-      cudaDeviceSynchronize();
 
       max_index<<<1, block_size_vocab>>>(d_output + Vocab*(N_tokens-1), 1, Vocab_OG, d_max_idx);
       cudaCheckErrors("kernel launch failure");
       cudaDeviceSynchronize();
-
-      set_new_embedding<<<1, block_size_linear>>>(d_input, Dim, N_tokens, d_emb, d_max_idx, d_pos);
-      cudaCheckErrors("kernel launch failure");
-      cudaDeviceSynchronize();
-
-      cudaMemcpy(d_input, d_input2, N_tokens*Dim*sizeof(float), cudaMemcpyDeviceToDevice);
 
       return 0;
 
@@ -665,7 +640,7 @@ int main(){
     float *d_input, *d_output, *d_Q, *d_K, *d_QK, *d_V, *d_ACT, *d_ACT_wide,
         *d_linear[N_Layers][4], *d_bias[N_Layers][4], *d_ln[N_Layers][4], *d_mlp1[N_Layers], 
         *d_mlp_bias1[N_Layers], *d_mlp2[N_Layers], *d_mlp_bias2[N_Layers], *d_final_ln[2], 
-        *d_proj_linear, *d_act2, *d_emb, *d_pos, *d_input2;
+        *d_proj_linear, *d_act2, *d_emb, *d_pos;
         int *d_max_idx;
 
 
@@ -789,7 +764,6 @@ int main(){
     // allocate device space
 
     cudaMalloc(&d_input, N*Dim*sizeof(float));
-    cudaMalloc(&d_input2, N*Dim*sizeof(float));
     cudaMalloc(&d_output, N*Vocab*sizeof(float));
     cudaMalloc(&d_Q, N*Dim*sizeof(float));
     cudaMalloc(&d_K, N*Dim*sizeof(float));
@@ -863,23 +837,50 @@ int main(){
     int *new_token = new int;
     *new_token = 0;
 
+
     for (int z = 0; z < num_new_tokens; z++){
 
+
+      // Launch kernel
       Transformer(d_input, d_Q, d_K, d_V, d_QK, d_ACT, d_ACT_wide, d_linear, d_bias,
       d_ln, d_mlp1, d_mlp_bias1, d_mlp2, d_mlp_bias2, d_final_ln, d_proj_linear, d_output, 
-      Dim, N, N_tokens,h_output, h_test, d_act2, d_max_idx, new_token, d_emb, d_pos, d_input2);
+      Dim, N, N_tokens,h_output, h_test, d_act2, d_max_idx, new_token );
       cudaCheckErrors("kernel launch failure");
 
+      // synchronize device
       cudaDeviceSynchronize();
+
+      // // Copy results back to host
+      cudaMemcpy(h_output, d_output, N*Vocab*sizeof(float), cudaMemcpyDeviceToHost);
+      cudaCheckErrors("cudaMemcpy D2H failure");
 
       cudaMemcpy(new_token, d_max_idx, sizeof(int), cudaMemcpyDeviceToHost);
       cudaCheckErrors("cudaMemcpy D2H failure");
       cudaDeviceSynchronize();
 
-      printf("new token %d\n", *new_token);
-      cudaDeviceSynchronize();
 
-      N_tokens++;
+    //   // find max value index
+    //   float max = -INFINITY;
+    //   int nnew_token = 0;
+    //   for (int j = 0; j < Vocab_OG; j++){
+    //     if (h_output[(N_tokens-1)*Vocab + j] > max){
+    //       max = h_output[(N_tokens-1)*Vocab + j];
+    //       nnew_token = j;
+    //     }
+    //   }
+    printf("new token idx = %d\n", *new_token);
+    cudaDeviceSynchronize();
+
+    // add the new token to the input
+    for (int j = 0; j < Dim; j++)
+    h_input[N_tokens*Dim + j] = h_emb[new_token[0]*Dim + j] + h_pos[N_tokens*Dim + j];
+    
+    // copy new input to device
+    cudaMemcpy(d_input, h_input, N*Dim*sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaDeviceSynchronize();
+
+    N_tokens++;
 
     }
 
